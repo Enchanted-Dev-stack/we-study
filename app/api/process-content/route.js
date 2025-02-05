@@ -208,7 +208,7 @@ async function generateStudyMaterials(content) {
               "Third option",
               "Fourth option"
             ],
-            "correctAnswer": "First option",
+            "correctAnswer": "First option"
           }
         ],
         "hashtags": ["topic", "subtopic"],
@@ -225,7 +225,6 @@ async function generateStudyMaterials(content) {
       6. Arrays and objects must use square and curly brackets
       7. Use commas between items
       8. No trailing commas
-      9. Give atleast6 quizes from low to high difficulty level
     `;
 
     // Process content
