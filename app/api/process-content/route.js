@@ -40,131 +40,259 @@ async function extractContent(url) {
   }
 }
 
+async function sanitizeJsonString(text) {
+  try {
+    // Remove markdown code blocks first
+    let cleaned = text.replace(/```json\n?|\n?```/g, '').trim();
+    
+    try {
+      // If it's already valid JSON, return it
+      JSON.parse(cleaned);
+      return cleaned;
+    } catch (e) {
+      // Continue with cleaning if not valid JSON
+    }
+
+    // Extract the JSON object if it's wrapped in other text
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      cleaned = jsonMatch[0];
+    }
+
+    // Replace escaped quotes and normalize quotes
+    cleaned = cleaned
+      .replace(/\\"/g, "'")
+      .replace(/(\w)"(\w)/g, "$1'$2")
+      .replace(/([:{,]\s*)"([^"]+)"/g, '$1"$2"')
+      .replace(/([:{,]\s*)([a-zA-Z0-9_]+):/g, '$1"$2":');
+
+    // Handle nested quotes in text
+    cleaned = cleaned.replace(/"([^"]*)"([^"]*)"([^"]*)"/g, (match, p1, p2, p3) => {
+      const fixed = (p1 + p2 + p3).replace(/"/g, "'");
+      return `"${fixed}"`;
+    });
+
+    return cleaned;
+  } catch (error) {
+    console.error('Error in sanitizeJsonString:', error);
+    throw error;
+  }
+}
+
+async function parseGeminiResponse(response) {
+  try {
+    const text = response.text();
+    console.log('Raw response text:', text.substring(0, 200) + '...');
+
+    // First attempt: direct parse after basic cleanup
+    const sanitizedText = await sanitizeJsonString(text);
+    
+    try {
+      return JSON.parse(sanitizedText);
+    } catch (firstError) {
+      console.error('First parse attempt failed:', firstError);
+      console.log('Failed text:', sanitizedText);
+      
+      // Second attempt: more aggressive cleaning
+      let fixedText = sanitizedText
+        // Fix potential quote issues
+        .replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3')
+        // Ensure proper quotes around string values
+        .replace(/:\s*"?([^",}\]]+)"?([,}])/g, ':"$1"$2')
+        // Fix arrays with unquoted strings
+        .replace(/\[([^\]]+)\]/g, (match, p1) => {
+          return '[' + p1.split(',')
+            .map(item => item.trim())
+            .map(item => item.startsWith('"') ? item : `"${item}"`)
+            .join(',') + ']';
+        });
+
+      console.log('Fixed text:', fixedText.substring(0, 200) + '...');
+
+      try {
+        return JSON.parse(fixedText);
+      } catch (secondError) {
+        console.error('Second parse attempt failed:', secondError);
+        
+        // Third attempt: try to extract valid JSON
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const extractedJson = jsonMatch[0];
+          console.log('Extracted JSON:', extractedJson.substring(0, 200) + '...');
+          
+          try {
+            return JSON.parse(extractedJson);
+          } catch (thirdError) {
+            console.error('Third parse attempt failed:', thirdError);
+            throw thirdError;
+          }
+        }
+        throw secondError;
+      }
+    }
+  } catch (error) {
+    console.error('Failed to parse Gemini response:', error);
+    throw new Error('Invalid response format from AI. Details: ' + error.message);
+  }
+}
+
+// Utility function for delay
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Retry function with exponential backoff
+async function retryWithBackoff(fn, maxRetries = 5, initialDelay = 10000) {
+  let retries = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (error) {
+      retries++;
+      
+      // Stop if we've exceeded max retries
+      if (retries > maxRetries) {
+        console.error(`Failed after ${maxRetries} retries:`, error);
+        throw error;
+      }
+
+      // Calculate delay based on error type
+      let waitTime = initialDelay;
+      if (error.status === 429) { // Rate limit
+        waitTime = initialDelay * Math.pow(2, retries - 1); // 10s, 20s, 40s, etc.
+        console.log(`Rate limited. Waiting ${waitTime/1000} seconds before retry ${retries}/${maxRetries}`);
+      } else if (error.status === 500) { // Internal server error
+        waitTime = 15000; // Fixed 15 second delay for server errors
+        console.log(`Server error. Waiting ${waitTime/1000} seconds before retry ${retries}/${maxRetries}`);
+      } else {
+        throw error; // For other errors, don't retry
+      }
+
+      // Wait before retrying
+      await delay(waitTime);
+    }
+  }
+}
+
 async function generateStudyMaterials(content) {
   try {
     const model = genAI.getGenerativeModel({ model: "gemini-pro" });
     
-    // Calculate number of items based on content length
-    // Using a more generous ratio: 1 flashcard per 200 chars, 1 quiz per 300 chars
-    const contentLength = content.length;
-    const flashcardsCount = Math.min(Math.floor(contentLength / 200), 100); // Up to 100 flashcards
-    const quizCount = Math.min(Math.floor(contentLength / 300), 100); // Up to 50 quiz questions
-
-    // For very long content, we'll process it in chunks to get better coverage
     const chunks = [];
-    const chunkSize = 4000; // Gemini handles 4k chunks well
+    const chunkSize = 4000;
     for (let i = 0; i < content.length; i += chunkSize) {
       chunks.push(content.slice(i, i + chunkSize));
     }
 
     const prompt = `
-      You are a study material generator. Analyze the following content and create comprehensive educational materials.
-      This is chunk ${chunks.length > 1 ? 'of multiple chunks' : '1/1'} of the content.
-      The content length suggests we can generate up to ${flashcardsCount} flashcards and ${quizCount} quiz questions.
+      Generate study materials in valid JSON format. DO NOT use quotes within text content.
       
       Content to analyze: ${content.substring(0, 4000)}
-      
-      ${chunks.length > 1 ? 'Note: This is part of a larger content. Focus on the concepts present in this chunk.' : ''}
 
-      Generate a response in the following JSON format (no markdown, no code blocks):
+      Return ONLY a JSON object exactly like this example (no other text):
       {
         "summary": [
-          "Key point 1 - make it clear and concise",
-          "Key point 2 - focus on main concepts",
-          "Key point 3 - highlight important details",
-          "Additional key points as needed..."
+          "First key point about the topic",
+          "Second key point about the topic"
         ],
         "flashcards": [
           {
-            "question": "Clear question about a specific concept",
-            "answer": "Concise and accurate answer"
+            "question": "Simple question without quotes",
+            "answer": "Simple answer without quotes"
           }
         ],
         "quiz": [
           {
-            "question": "Detailed question to test understanding",
-            "options": ["Option A", "Option B", "Option C", "Option D"],
-            "correctAnswer": "Option that best answers the question",
-            "explanation": "Brief explanation of why this is the correct answer"
+            "question": "Simple question without quotes",
+            "options": [
+              "First option",
+              "Second option",
+              "Third option",
+              "Fourth option"
+            ],
+            "correctAnswer": "First option",
           }
         ],
-        "hashtags": [
-          "Add relevant topic hashtags",
-          "Include programming language if applicable",
-          "Include concept categories",
-          "4-8 hashtags total"
-        ],
-        "difficulty_level": "beginner|intermediate|advanced",
-        "estimated_study_time": "time in minutes"
+        "hashtags": ["topic", "subtopic"],
+        "difficulty_level": "beginner",
+        "estimated_study_time": "30 minutes"
       }
 
-      Rules:
-      1. Return ONLY valid JSON
-      2. Generate as many flashcards as possible from the content (up to ${flashcardsCount})
-      3. Generate as many quiz questions as possible from the content (up to ${quizCount})
-      4. Each question should focus on a different concept or aspect
-      5. Generate 4-8 relevant hashtags (without the # symbol)
-      6. Keep all responses educational and focused on the content
-      7. Make questions clear, specific, and non-repetitive
-      8. Ensure answers are accurate and helpful for learning
-      9. For hashtags, include:
-         - Main topic (e.g. java, python, javascript)
-         - Concept category (e.g. oop, algorithms, webdev)
-         - Specific topics (e.g. classes, inheritance, loops)
-      10. Add detailed explanations for quiz answers
-      11. Assess content difficulty and estimate study time
-      12. Cover different cognitive levels:
-          - Remember: recall facts and basic concepts
-          - Understand: explain ideas or concepts
-          - Apply: use information in new situations
-          - Analyze: draw connections among ideas
-          - Evaluate: justify a stand or decision
-      13. Include practical, real-world examples where possible
-      14. Make sure questions progress from basic to advanced concepts
+      IMPORTANT RULES:
+      1. Do not use quotes (") inside any text - rephrase to avoid them
+      2. Use simple words and punctuation only (periods, commas)
+      3. Keep all text content basic and clean
+      4. Format must be exact - no extra fields or formatting
+      5. Each string must be in double quotes
+      6. Arrays and objects must use square and curly brackets
+      7. Use commas between items
+      8. No trailing commas
+      9. Give atleast6 quizes from low to high difficulty level
     `;
 
-    // If content is very long, process each chunk and combine results
+    // Process content
     if (chunks.length > 1) {
       let allResults = [];
       for (const chunk of chunks) {
-        const result = await model.generateContent(prompt.replace(content.substring(0, 4000), chunk));
-        const chunkResult = JSON.parse(result.response.text().replace(/```json\n?|\n?```/g, '').trim());
-        allResults.push(chunkResult);
+        const chunkPrompt = prompt.replace(content.substring(0, 4000), chunk);
+        
+        const result = await retryWithBackoff(async () => {
+          const response = await model.generateContent(chunkPrompt);
+          const text = response.response.text();
+          const sanitized = await sanitizeJsonString(text);
+          return JSON.parse(sanitized);
+        });
+
+        allResults.push(result);
+        
+        // Add a delay between chunks to avoid rate limits
+        if (chunks.length > 1) {
+          await delay(5000); // 5 second delay between chunks
+        }
       }
 
-      // Combine results from all chunks
+      // Combine results
       return {
-        summary: allResults.flatMap(r => r.summary),
-        flashcards: allResults.flatMap(r => r.flashcards).slice(0, flashcardsCount),
-        quiz: allResults.flatMap(r => r.quiz).slice(0, quizCount),
-        hashtags: [...new Set(allResults.flatMap(r => r.hashtags))].slice(0, 8),
-        difficulty_level: allResults[0].difficulty_level,
-        estimated_study_time: allResults[0].estimated_study_time
+        summary: allResults.flatMap(r => r.summary || []),
+        flashcards: allResults.flatMap(r => r.flashcards || []),
+        quiz: allResults.flatMap(r => r.quiz || []),
+        hashtags: [...new Set(allResults.flatMap(r => r.hashtags || []))].slice(0, 8),
+        difficulty_level: allResults[0].difficulty_level || 'beginner',
+        estimated_study_time: allResults[0].estimated_study_time || '30 minutes'
       };
     }
 
-    // For shorter content, process in one go
-    const result = await model.generateContent(prompt);
-    const response = result.response;
-    const text = response.text();
-    
-    const cleanJson = text.replace(/```json\n?|\n?```/g, '').trim();
-    
-    try {
-      return JSON.parse(cleanJson);
-    } catch (parseError) {
-      console.error('Error parsing JSON:', parseError);
-      console.log('Raw response:', text);
-      throw new Error('Invalid JSON response from AI');
-    }
+    // For shorter content
+    return await retryWithBackoff(async () => {
+      const response = await model.generateContent(prompt);
+      const text = response.response.text();
+      const sanitized = await sanitizeJsonString(text);
+      return JSON.parse(sanitized);
+    });
+
   } catch (error) {
     console.error('Error generating study materials:', error);
+    if (error.status === 429) {
+      throw new Error('Rate limit exceeded. Please wait a moment and try again.');
+    } else if (error.status === 500) {
+      throw new Error('Server temporarily unavailable. Please try again.');
+    }
     throw new Error('Failed to generate study materials: ' + error.message);
   }
 }
 
 async function storeStudyMaterials(userId, url, materials) {
   try {
+    // Log the initial materials
+    console.log('Raw materials received:', {
+      summary: materials.summary?.length,
+      flashcards: materials.flashcards?.length,
+      quiz: materials.quiz?.length,
+      hashtags: materials.hashtags?.length
+    });
+
+    if (materials.quiz?.length > 0) {
+      console.log('First quiz item for reference:', materials.quiz[0]);
+    }
+
     // Store main study material
     const { data: studyMaterial, error: studyError } = await supabase
       .from('study_materials')
@@ -174,15 +302,23 @@ async function storeStudyMaterials(userId, url, materials) {
           url,
           summary: materials.summary,
           created_at: new Date().toISOString(),
+          difficulty_level: materials.difficulty_level,
+          estimated_study_time: materials.estimated_study_time
         }
       ])
       .select()
       .single();
 
-    if (studyError) throw studyError;
+    if (studyError) {
+      console.error('Error storing study material:', studyError);
+      throw studyError;
+    }
+
+    console.log('Successfully stored study material with ID:', studyMaterial.id);
 
     // Store flashcards
     if (materials.flashcards?.length > 0) {
+      console.log('Storing flashcards:', materials.flashcards.length);
       const { error: flashcardsError } = await supabase
         .from('flashcards')
         .insert(
@@ -194,29 +330,45 @@ async function storeStudyMaterials(userId, url, materials) {
           }))
         );
 
-      if (flashcardsError) throw flashcardsError;
+      if (flashcardsError) {
+        console.error('Error storing flashcards:', flashcardsError);
+        throw flashcardsError;
+      }
+      console.log('Successfully stored flashcards');
     }
 
     // Store quizzes
     if (materials.quiz?.length > 0) {
-      const { error: quizError } = await supabase
-        .from('quizzes')
-        .insert(
-          materials.quiz.map(q => ({
-            study_material_id: studyMaterial.id,
-            question: q.question,
-            options: q.options,
-            correct_answer: q.correctAnswer,
-            explanation: q.explanation,
-            user_id: userId
-          }))
-        );
+      console.log('Preparing to store quizzes. Count:', materials.quiz.length);
+      
+      // Log the formatted data for the first quiz
+      const formattedQuizzes = materials.quiz.map(q => ({
+        study_material_id: studyMaterial.id,
+        question: q.question,
+        options: `{${q.options.map(opt => `"${opt.replace(/"/g, '\\"')}"`).join(',')}}`,
+        correct_answer: q.correctAnswer,
+        user_id: userId
+      }));
 
-      if (quizError) throw quizError;
+      console.log('First formatted quiz for reference:', formattedQuizzes[0]);
+      
+      const { data: quizData, error: quizError } = await supabase
+        .from('quizzes')
+        .insert(formattedQuizzes)
+        .select();
+
+      if (quizError) {
+        console.error('Error storing quizzes:', quizError);
+        throw quizError;
+      }
+      console.log('Successfully stored quizzes. Count:', quizData?.length);
+    } else {
+      console.log('No quizzes to store');
     }
 
     // Store hashtags
     if (materials.hashtags?.length > 0) {
+      console.log('Storing hashtags:', materials.hashtags.length);
       const { error: hashtagsError } = await supabase
         .from('hashtags')
         .insert(
@@ -227,13 +379,24 @@ async function storeStudyMaterials(userId, url, materials) {
           }))
         );
 
-      if (hashtagsError) throw hashtagsError;
+      if (hashtagsError) {
+        console.error('Error storing hashtags:', hashtagsError);
+        throw hashtagsError;
+      }
+      console.log('Successfully stored hashtags');
     }
 
     return studyMaterial.id;
   } catch (error) {
     console.error('Error storing study materials:', error);
-    throw new Error('Failed to store study materials in database');
+    // Log the full error details
+    console.error('Full error details:', {
+      message: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint
+    });
+    throw error;
   }
 }
 

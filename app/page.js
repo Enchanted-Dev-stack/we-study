@@ -183,35 +183,51 @@ export default function Home() {
                 </div>
 
                 <h3 className="mt-4 text-md font-semibold text-gray-900">
-                  Quiz ({studyMaterials.quiz.length})
+                  Quiz ({studyMaterials.quiz?.length || 0})
                 </h3>
                 <div className="mt-2 space-y-4">
-                  {studyMaterials.quiz.map((question, index) => (
+                  {studyMaterials.quiz && studyMaterials.quiz.map((question, index) => (
                     <div key={index} className="rounded-lg border border-gray-200 p-4">
-                      <p className="font-medium text-gray-900">{question.question}</p>
+                      <p className="font-medium text-gray-900">
+                        {index + 1}. {question.question}
+                      </p>
                       <div className="mt-2 space-y-2">
-                        {question.options.map((option, optionIndex) => (
+                        {Array.isArray(question.options) && question.options.map((option, optionIndex) => (
                           <div key={optionIndex} className="flex items-center">
                             <input
                               type="radio"
                               name={`question-${index}`}
                               value={option}
+                              id={`question-${index}-option-${optionIndex}`}
                               className="h-4 w-4 border-gray-300 text-indigo-600 focus:ring-indigo-600"
                             />
-                            <label className="ml-2 text-sm text-gray-600">{option}</label>
+                            <label 
+                              htmlFor={`question-${index}-option-${optionIndex}`}
+                              className="ml-2 text-sm text-gray-600"
+                            >
+                              {option}
+                            </label>
                           </div>
                         ))}
                       </div>
-                      {question.explanation && (
-                        <div className="mt-3 text-sm">
-                          <details className="text-gray-600">
-                            <summary className="cursor-pointer text-indigo-600 hover:text-indigo-500">
-                              View Explanation
-                            </summary>
-                            <p className="mt-2 pl-4">{question.explanation}</p>
-                          </details>
-                        </div>
-                      )}
+                      <div className="mt-4">
+                        <button
+                          type="button"
+                          className="text-sm text-indigo-600 hover:text-indigo-500"
+                          onClick={() => {
+                            const selectedOption = document.querySelector(`input[name="question-${index}"]:checked`)?.value;
+                            if (selectedOption) {
+                              alert(selectedOption === question.correctAnswer ? 
+                                'Correct! 🎉' : 
+                                `Incorrect. The correct answer is: ${question.correctAnswer}`);
+                            } else {
+                              alert('Please select an answer first.');
+                            }
+                          }}
+                        >
+                          Check Answer
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
