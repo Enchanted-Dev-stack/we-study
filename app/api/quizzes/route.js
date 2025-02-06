@@ -36,7 +36,8 @@ export async function GET(request) {
           url,
           summary,
           difficulty_level,
-          estimated_study_time
+          estimated_study_time,
+          thumbnail
         )
       `)
       .eq('user_id', userId)

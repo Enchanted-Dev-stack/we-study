@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '../hooks/useAuth';
+import Image from 'next/image';
 
 export default function QuizzesPage() {
   const [quizzes, setQuizzes] = useState([]);
@@ -94,7 +95,8 @@ export default function QuizzesPage() {
         quizzes: [],
         metadata: {
           difficulty_level: quiz.study_materials?.difficulty_level,
-          estimated_study_time: quiz.study_materials?.estimated_study_time
+          estimated_study_time: quiz.study_materials?.estimated_study_time,
+          thumbnail: quiz.study_materials?.thumbnail
         }
       };
     }
@@ -148,9 +150,9 @@ export default function QuizzesPage() {
           )}
         </div>
 
-        <div className="space-y-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
           {Object.keys(groupedQuizzes).length === 0 ? (
-            <div className="text-center py-12">
+            <div className="col-span-full text-center py-12">
               <h3 className="text-lg font-medium text-gray-900">No quizzes yet</h3>
               <p className="mt-2 text-gray-600">
                 Process some content to generate quizzes and test your knowledge.
@@ -164,93 +166,55 @@ export default function QuizzesPage() {
             </div>
           ) : (
             Object.entries(groupedQuizzes).map(([sourceUrl, { quizzes: sourceQuizzes, metadata }]) => (
-              <div key={sourceUrl} className="bg-white shadow rounded-lg overflow-hidden">
-                <button
-                  onClick={() => toggleSource(sourceUrl)}
-                  className="w-full px-6 py-4 flex items-center justify-between bg-gray-50 hover:bg-gray-100 transition-colors"
-                >
-                  <div className="flex-1">
-                    <h3 className="text-lg font-medium text-gray-900 text-left truncate">
-                      {sourceUrl}
-                    </h3>
-                    <p className="mt-1 text-sm text-gray-500">
-                      {sourceQuizzes.length} quizzes • {metadata.difficulty_level} • {metadata.estimated_study_time}
-                    </p>
+              <div 
+                key={sourceUrl} 
+                className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-shadow cursor-pointer"
+                onClick={() => router.push(`/quizzes/${encodeURIComponent(sourceUrl)}`)}
+              >
+                {/* Thumbnail with 16:9 aspect ratio */}
+                <div className="relative w-full" style={{ paddingTop: '56.25%' }}>
+                  {metadata.thumbnail ? (
+                    <Image
+                      src={metadata.thumbnail}
+                      alt="Video thumbnail"
+                      fill
+                      className="absolute inset-0 w-full h-full object-cover"
+                      onError={(e) => {
+                        e.currentTarget.style.display = 'none';
+                        e.currentTarget.parentElement.classList.add('bg-gradient-to-r', 'from-indigo-500', 'to-purple-600');
+                      }}
+                    />
+                  ) : (
+                    <div className="absolute inset-0 bg-gradient-to-r from-indigo-500 to-purple-600 flex items-center justify-center">
+                      <svg
+                        className="w-12 h-12 text-white opacity-75"
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth={2}
+                          d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
+                        />
+                      </svg>
+                    </div>
+                  )}
+                </div>
+
+                <div className="p-4">
+                  <h3 className="font-medium text-gray-900 line-clamp-2 mb-2">
+                    {sourceUrl}
+                  </h3>
+                  <div className="flex items-center justify-between text-sm text-gray-500">
+                    <span>{sourceQuizzes.length} quizzes</span>
+                    <span>{metadata.difficulty_level}</span>
                   </div>
-                  <svg
-                    className={`w-5 h-5 text-gray-500 transform transition-transform ${
-                      expandedSources.has(sourceUrl) ? 'rotate-180' : ''
-                    }`}
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                  </svg>
-                </button>
-
-                {expandedSources.has(sourceUrl) && (
-                  <div className="divide-y divide-gray-200">
-                    {sourceQuizzes.map((quiz) => (
-                      <div key={quiz.id} className="p-6">
-                        <div className="space-y-4">
-                          <div className="flex justify-between items-start">
-                            <h3 className="text-lg font-medium text-gray-900">{quiz.question}</h3>
-                            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-800">
-                              {quiz.study_materials.difficulty_level}
-                            </span>
-                          </div>
-
-                          <div className="space-y-2">
-                            {quiz.options.map((option, index) => (
-                              <label
-                                key={index}
-                                className={`flex items-center p-3 rounded-lg border ${
-                                  userAnswers[quiz.id] === option
-                                    ? 'border-indigo-500 bg-indigo-50'
-                                    : 'border-gray-200 hover:bg-gray-50'
-                                } cursor-pointer transition-colors`}
-                              >
-                                <input
-                                  type="radio"
-                                  name={`quiz-${quiz.id}`}
-                                  value={option}
-                                  checked={userAnswers[quiz.id] === option}
-                                  onChange={() => handleAnswerSelect(quiz.id, option)}
-                                  className="h-4 w-4 text-indigo-600 border-gray-300 focus:ring-indigo-500"
-                                />
-                                <span className="ml-3 text-gray-700">{option}</span>
-                              </label>
-                            ))}
-                          </div>
-
-                          <div className="flex items-center justify-between mt-4">
-                            <button
-                              onClick={() => checkAnswer(quiz.id)}
-                              className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-indigo-600 hover:bg-indigo-700"
-                            >
-                              Check Answer
-                            </button>
-
-                            {feedback[quiz.id] && (
-                              <div
-                                className={`px-4 py-2 rounded-md text-sm ${
-                                  feedback[quiz.id].type === 'success'
-                                    ? 'bg-green-100 text-green-800'
-                                    : feedback[quiz.id].type === 'error'
-                                    ? 'bg-red-100 text-red-800'
-                                    : 'bg-yellow-100 text-yellow-800'
-                                }`}
-                              >
-                                {feedback[quiz.id].message}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    ))}
+                  <div className="mt-2 text-xs text-gray-500">
+                    Estimated time: {metadata.estimated_study_time}
                   </div>
-                )}
+                </div>
               </div>
             ))
           )}

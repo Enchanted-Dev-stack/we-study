@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from './hooks/useAuth';
 import { motion } from 'framer-motion';
+import StudyMaterialsModal from './components/StudyMaterialsModal';
 
 export default function Home() {
   const { user, signInWithGoogle } = useAuth();
@@ -14,6 +15,24 @@ export default function Home() {
     flashcardsCount: 0,
     quizzesCount: 0
   });
+  const [processingSteps, setProcessingSteps] = useState([]);
+  const [currentStep, setCurrentStep] = useState(null);
+  const [showModal, setShowModal] = useState(false);
+
+  // Function to add a new processing step
+  const addProcessingStep = (step, status = 'pending') => {
+    setProcessingSteps(prev => [...prev, { step, status, timestamp: new Date() }]);
+    setCurrentStep(step);
+  };
+
+  // Function to update step status
+  const updateStepStatus = (step, status) => {
+    setProcessingSteps(prev => 
+      prev.map(s => 
+        s.step === step ? { ...s, status } : s
+      )
+    );
+  };
 
   // Fetch user stats when user logs in or study materials change
   useEffect(() => {
@@ -36,13 +55,29 @@ export default function Home() {
     fetchUserStats();
   }, [user, studyMaterials]); // Re-fetch when user or study materials change
 
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
   const handleSubmit = async (e) => {
     e.preventDefault();
+    if (loading) return;
     setLoading(true);
     setError(null);
     setStudyMaterials(null);
+    setProcessingSteps([]); // Reset steps
 
     try {
+      // Show initializing for 3 seconds
+      addProcessingStep('Initializing request');
+      await sleep(3000);
+      updateStepStatus('Initializing request', 'completed');
+      
+      // Add YouTube transcript step if it's a YouTube URL
+      if (url.includes('youtube.com') || url.includes('youtu.be')) {
+        addProcessingStep('Fetching YouTube transcript');
+      } else {
+        addProcessingStep('Extracting content from URL');
+      }
+
       const response = await fetch('/api/process-content', {
         method: 'POST',
         headers: {
@@ -59,11 +94,35 @@ export default function Home() {
       }
 
       const data = await response.json();
+      if (!data) {
+        throw new Error('No data received');
+      }
+
+      // Update transcript/content step
+      updateStepStatus(currentStep, 'completed');
+
+      // Add and show generating materials step
+      addProcessingStep('Generating study materials');
+      await sleep(2000); // Show for at least 2 seconds
+      updateStepStatus('Generating study materials', 'completed');
+      
+      // Add saving step
+      addProcessingStep('Saving to database');
+      await sleep(1000); // Show for at least 1 second
+      updateStepStatus('Saving to database', 'completed');
+      
+      // Final success step
+      addProcessingStep('Content processed successfully', 'completed');
+      
       setStudyMaterials(data);
-      setUrl(''); // Clear the input after successful processing
+      setShowModal(true); // Show modal when materials are ready
+      setUrl('');
+      setLoading(false);
     } catch (err) {
+      // Add error step and update current step as failed
+      updateStepStatus(currentStep, 'error');
+      addProcessingStep(`Error: ${err.message}`, 'error');
       setError(err.message);
-    } finally {
       setLoading(false);
     }
   };
@@ -130,123 +189,39 @@ export default function Home() {
               </button>
             </form>
 
-            {error && (
-              <div className="mt-4 rounded-md bg-red-50 p-4">
-                <div className="flex">
-                  <div className="ml-3">
-                    <h3 className="text-sm font-medium text-red-800">Error processing content</h3>
-                    <div className="mt-2 text-sm text-red-700">
-                      <p>{error}</p>
+            {/* Progress Indicator */}
+            {loading && processingSteps.length > 0 && (
+              <div className="mt-4 rounded-lg border border-gray-200 bg-gray-50 p-4 font-mono text-sm">
+                <div className="space-y-2">
+                  {processingSteps.map(({ step, status, timestamp }, index) => (
+                    <div key={index} className="flex items-center space-x-2">
+                      {/* Status indicator */}
+                      {status === 'pending' && (
+                        <svg className="h-4 w-4 animate-spin text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                      )}
+                      {status === 'completed' && (
+                        <svg className="h-4 w-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7"></path>
+                        </svg>
+                      )}
+                      {status === 'error' && (
+                        <svg className="h-4 w-4 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path>
+                        </svg>
+                      )}
+                      <span className={status === 'error' ? 'text-red-600' : ''}>{step}</span>
                     </div>
-                  </div>
+                  ))}
                 </div>
               </div>
             )}
 
-            {studyMaterials && (
-              <div className="mt-6">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-md font-semibold text-gray-900">Summary</h3>
-                  {studyMaterials.difficulty_level && (
-                    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                      studyMaterials.difficulty_level === 'beginner' ? 'bg-green-100 text-green-800' :
-                      studyMaterials.difficulty_level === 'intermediate' ? 'bg-yellow-100 text-yellow-800' :
-                      'bg-red-100 text-red-800'
-                    }`}>
-                      {studyMaterials.difficulty_level}
-                    </span>
-                  )}
-                </div>
-                
-                {studyMaterials.estimated_study_time && (
-                  <p className="mt-2 text-sm text-gray-500">
-                    Estimated study time: {studyMaterials.estimated_study_time}
-                  </p>
-                )}
-
-                <ul className="mt-2 list-disc pl-5 space-y-1">
-                  {studyMaterials.summary.map((point, index) => (
-                    <li key={index} className="text-sm text-gray-600">{point}</li>
-                  ))}
-                </ul>
-
-                <h3 className="mt-4 text-md font-semibold text-gray-900">
-                  Flashcards ({studyMaterials.flashcards.length})
-                </h3>
-                <div className="mt-2 space-y-3">
-                  {studyMaterials.flashcards.map((card, index) => (
-                    <div key={index} className="rounded-lg border border-gray-200 p-4">
-                      <p className="font-medium text-gray-900">{card.question}</p>
-                      <p className="mt-2 text-sm text-gray-600">{card.answer}</p>
-                    </div>
-                  ))}
-                </div>
-
-                <h3 className="mt-4 text-md font-semibold text-gray-900">
-                  Quiz ({studyMaterials.quiz?.length || 0})
-                </h3>
-                <div className="mt-2 space-y-4">
-                  {studyMaterials.quiz && studyMaterials.quiz.map((question, index) => (
-                    <div key={index} className="rounded-lg border border-gray-200 p-4">
-                      <p className="font-medium text-gray-900">
-                        {index + 1}. {question.question}
-                      </p>
-                      <div className="mt-2 space-y-2">
-                        {Array.isArray(question.options) && question.options.map((option, optionIndex) => (
-                          <div key={optionIndex} className="flex items-center">
-                            <input
-                              type="radio"
-                              name={`question-${index}`}
-                              value={option}
-                              id={`question-${index}-option-${optionIndex}`}
-                              className="h-4 w-4 border-gray-300 text-indigo-600 focus:ring-indigo-600"
-                            />
-                            <label 
-                              htmlFor={`question-${index}-option-${optionIndex}`}
-                              className="ml-2 text-sm text-gray-600"
-                            >
-                              {option}
-                            </label>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="mt-4">
-                        <button
-                          type="button"
-                          className="text-sm text-indigo-600 hover:text-indigo-500"
-                          onClick={() => {
-                            const selectedOption = document.querySelector(`input[name="question-${index}"]:checked`)?.value;
-                            if (selectedOption) {
-                              alert(selectedOption === question.correctAnswer ? 
-                                'Correct! 🎉' : 
-                                `Incorrect. The correct answer is: ${question.correctAnswer}`);
-                            } else {
-                              alert('Please select an answer first.');
-                            }
-                          }}
-                        >
-                          Check Answer
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                {studyMaterials.hashtags && (
-                  <div className="mt-4">
-                    <h3 className="text-md font-semibold text-gray-900">Topics</h3>
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      {studyMaterials.hashtags.map((tag, index) => (
-                        <span
-                          key={index}
-                          className="inline-flex items-center rounded-full bg-indigo-50 px-2 py-1 text-xs font-medium text-indigo-700"
-                        >
-                          #{tag}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
+            {error && (
+              <div className="mt-4 rounded-lg bg-red-50 p-4 text-sm text-red-600">
+                {error}
               </div>
             )}
           </motion.div>
@@ -257,37 +232,27 @@ export default function Home() {
             animate={{ opacity: 1, x: 0 }}
             className="rounded-lg bg-white p-6 shadow-sm"
           >
-            <h2 className="text-lg font-semibold text-gray-900">Your Progress</h2>
-            <dl className="mt-6 grid grid-cols-1 gap-6 sm:grid-cols-2">
-              <div className="overflow-hidden rounded-lg bg-white px-4 py-5 shadow ring-1 ring-gray-300 sm:p-6">
-                <dt className="truncate text-sm font-medium text-gray-500">Flashcards Created</dt>
-                <dd className="mt-1 text-3xl font-semibold tracking-tight text-gray-900">
-                  {stats.flashcardsCount}
-                </dd>
+            <h2 className="text-lg font-semibold text-gray-900">Your Study Stats</h2>
+            <div className="mt-6 grid grid-cols-2 gap-6">
+              <div className="rounded-lg bg-indigo-50 p-4">
+                <h3 className="text-sm font-medium text-indigo-600">Flashcards Created</h3>
+                <p className="mt-2 text-3xl font-semibold text-indigo-900">{stats.flashcardsCount}</p>
               </div>
-              <div className="overflow-hidden rounded-lg bg-white px-4 py-5 shadow ring-1 ring-gray-300 sm:p-6">
-                <dt className="truncate text-sm font-medium text-gray-500">Quizzes Completed</dt>
-                <dd className="mt-1 text-3xl font-semibold tracking-tight text-gray-900">
-                  {stats.quizzesCount}
-                </dd>
+              <div className="rounded-lg bg-green-50 p-4">
+                <h3 className="text-sm font-medium text-green-600">Quizzes Generated</h3>
+                <p className="mt-2 text-3xl font-semibold text-green-900">{stats.quizzesCount}</p>
               </div>
-            </dl>
+            </div>
           </motion.div>
         </div>
-
-        {/* Recent Activity Section */}
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.2 }}
-          className="mt-8 rounded-lg bg-white p-6 shadow-sm"
-        >
-          <h2 className="text-lg font-semibold text-gray-900">Recent Activity</h2>
-          <div className="mt-6">
-            <p className="text-sm text-gray-500">No recent activity</p>
-          </div>
-        </motion.div>
       </div>
+
+      {/* Study Materials Modal */}
+      <StudyMaterialsModal
+        isOpen={showModal}
+        onClose={() => setShowModal(false)}
+        materials={studyMaterials}
+      />
     </main>
   );
 }
