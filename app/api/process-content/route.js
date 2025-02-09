@@ -1,9 +1,164 @@
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { NextResponse } from 'next/server';
 import { supabase } from '@/app/lib/supabase';
 import { getVideoTranscript, getVideoId, getVideoThumbnail } from '@/app/utils/youtube';
 
-// Initialize OpenRouter
-const openRouterApiKey = process.env.OPENROUTER_API_KEY;
+// Initialize Gemini Pro
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_AI_KEY);
+
+function isYouTubeUrl(url) {
+  return url.match(/^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/);
+}
+
+async function checkExistingContent(url) {
+  const { data, error } = await supabase
+    .from('study_materials')
+    .select('*')
+    .eq('url', url)
+    .single();
+
+  if (error && error.code !== 'PGRST116') { // PGRST116 is "not found" error
+    console.error('Error checking existing content:', error);
+  }
+
+  return data;
+}
+
+async function extractContent(url) {
+  try {
+    if (isYouTubeUrl(url)) {
+      return await getVideoTranscript(url);
+    } else {
+      const response = await fetch(url);
+      const html = await response.text();
+      const textContent = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+      return textContent;
+    }
+  } catch (error) {
+    console.error('Error extracting content:', error);
+    throw new Error('Failed to extract content from URL: ' + error.message);
+  }
+}
+
+// Sanitize and parse JSON from AI response while preserving content
+function sanitizeAndParseJSON(text) {
+  try {
+    // First try parsing as is
+    return JSON.parse(text);
+  } catch (firstError) {
+    console.log('First parse attempt failed:', firstError.message);
+    
+    try {
+      // Clean the text - only fixing JSON structure issues
+      let cleanText = text
+        // Remove any potential script tags
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '')
+        // Fix JSON structure issues only
+        .replace(/(["\]}])[\n\r]+(["\[{])/g, '$1,$2')
+        // Remove trailing commas
+        .replace(/,(\s*[}\]])/g, '$1');
+
+      // Try to find where the JSON actually starts
+      const jsonStart = cleanText.indexOf('{');
+      if (jsonStart !== -1) {
+        cleanText = cleanText.substring(jsonStart);
+      }
+
+      // Try to find where the JSON actually ends
+      const jsonEnd = cleanText.lastIndexOf('}');
+      if (jsonEnd !== -1) {
+        cleanText = cleanText.substring(0, jsonEnd + 1);
+      }
+
+      // Try parsing the cleaned text
+      try {
+        const parsed = JSON.parse(cleanText);
+        
+        // Validate the structure but preserve content
+        if (!parsed.summary || !Array.isArray(parsed.summary) ||
+            !parsed.flashcards || !Array.isArray(parsed.flashcards) ||
+            !parsed.quiz || !Array.isArray(parsed.quiz)) {
+          throw new Error('Invalid study materials structure');
+        }
+
+        // Only trim whitespace at start/end, preserve internal formatting
+        parsed.summary = parsed.summary
+          .map(item => String(item).trim())
+          .filter(Boolean);
+
+        parsed.flashcards = parsed.flashcards
+          .filter(card => card && typeof card.question === 'string' && typeof card.answer === 'string')
+          .map(card => ({
+            question: card.question.trim(),
+            answer: card.answer.trim()
+          }));
+
+        parsed.quiz = parsed.quiz
+          .filter(q => q && typeof q.question === 'string' && Array.isArray(q.options) && typeof q.correctAnswer === 'string')
+          .map(q => ({
+            question: q.question.trim(),
+            options: q.options.map(opt => String(opt).trim()),
+            correctAnswer: q.correctAnswer.trim(),
+            difficulty: q.difficulty || 'medium'
+          }));
+
+        return parsed;
+      } catch (parseError) {
+        console.error('Failed to parse cleaned JSON:', parseError.message);
+        
+        // If we still can't parse, try one more time with more aggressive cleaning
+        // but ONLY on the JSON structure, not the content
+        try {
+          cleanText = cleanText
+            // Fix potential unmatched quotes in property names only
+            .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g, '$1"$2"$3')
+            // Ensure property names are properly quoted
+            .replace(/([{,]\s*)([^"\s][^:\s]*)(\s*:)/g, '$1"$2"$3');
+
+          const finalParsed = JSON.parse(cleanText);
+          
+          // Apply the same validation as before
+          if (!finalParsed.summary || !Array.isArray(finalParsed.summary) ||
+              !finalParsed.flashcards || !Array.isArray(finalParsed.flashcards) ||
+              !finalParsed.quiz || !Array.isArray(finalParsed.quiz)) {
+            throw new Error('Invalid study materials structure');
+          }
+
+          return finalParsed;
+        } catch (finalError) {
+          throw new Error('Invalid JSON structure after cleaning');
+        }
+      }
+    } catch (error) {
+      console.error('JSON sanitization failed:', error.message);
+      throw new Error('Failed to process AI response');
+    }
+  }
+}
+
+async function makeGenerateRequest(model, prompt, retryCount = 0) {
+  try {
+    const response = await model.generateContent(prompt);
+    const text = response.response.text();
+    
+    try {
+      return sanitizeAndParseJSON(text);
+    } catch (error) {
+      console.error('Error parsing AI response:', error.message);
+      
+      // If we have retries left and it's a parsing error, try again
+      if (retryCount < 2) {
+        console.log(`Retrying generate request (attempt ${retryCount + 1})`);
+        return makeGenerateRequest(model, prompt, retryCount + 1);
+      }
+      
+      throw new Error('Failed to parse AI response after retries');
+    }
+  } catch (error) {
+    console.error('Error in generate request:', error.message);
+    throw error;
+  }
+}
 
 // Utility function for delay
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -17,155 +172,134 @@ function chunkArray(array, size) {
   return chunks;
 }
 
-// Sanitize JSON string
-function sanitizeJsonString(str) {
+async function generateStudyMaterials(content) {
   try {
-    // First try to find JSON-like structure
-    const jsonStart = str.indexOf('{');
-    const jsonEnd = str.lastIndexOf('}');
+    console.log('Starting study materials generation...');
     
-    if (jsonStart === -1 || jsonEnd === -1) {
-      throw new Error('No JSON object found');
-    }
-
-    let jsonStr = str.slice(jsonStart, jsonEnd + 1);
+    // Split content into smaller chunks for processing
+    const chunkSize = 10000; // Process 5000 characters at a time
+    const contentChunks = content.match(new RegExp(`.{1,${chunkSize}}`, 'g')) || [];
+    const concurrencyLimit = 3; // Process 3 chunks at a time
     
-    // Remove any markdown formatting or text outside the JSON
-    jsonStr = jsonStr.replace(/```json/g, '').replace(/```/g, '');
-    
-    // Fix common formatting issues
-    jsonStr = jsonStr
-      .replace(/(\w+):/g, '"$1":')  // Add quotes to property names
-      .replace(/:\s*"([^"]*)"(\s*[}\],])/g, ':"$1"$2')  // Fix trailing quotes
-      .replace(/,(\s*[}\]])/g, '$1'); // Remove trailing commas
-    
-    return jsonStr;
-  } catch (error) {
-    console.error('Error sanitizing JSON string:', error);
-    throw error;
-  }
-}
+    const chunks = chunkArray(contentChunks, concurrencyLimit);
+    let allResponses = [];
 
-async function generateStudyMaterials(content, chunk_index = 0) {
-  try {
-    const requestBody = {
-      model: 'google/gemini-2.0-flash-thinking-exp:free',
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: `Generate study materials from this content. Output ONLY a JSON object with this exact structure:
+    for (let i = 0; i < chunks.length; i++) {
+      const chunkGroup = chunks[i];
+      console.log(`Processing chunk group ${i + 1}/${chunks.length}`);
 
-{
-  "summary": "Brief overview of the content",
-  "questions": [
-    {
-      "question": "Clear question text",
-      "options": [
-        "Option 1",
-        "Option 2", 
-        "Option 3",
-        "Option 4"
-      ],
-      "correct_answer": "Option 1"
-    }
-  ],
-  "difficulty_level": "beginner",
-  "estimated_study_time": 30
-}
+      try {
+        // Process chunks in parallel
+        const chunkPromises = chunkGroup.map(async (chunk, index) => {
+          const prompt = generatePrompt(chunk);
+          const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+          return makeGenerateRequest(model, prompt);
+        });
 
-Rules:
-1. Output ONLY the JSON object, no other text
-2. Generate exactly 5 multiple choice questions
-3. Each question must have exactly 4 options
-4. Difficulty level must be one of: beginner, intermediate, advanced
-5. Estimated time should be in minutes
-6. Ensure all JSON is properly formatted with quotes around strings
+        const chunkResults = await Promise.all(chunkPromises);
+        allResponses = allResponses.concat(chunkResults);
 
-Content to process: ${content}`
-            }
-          ]
+        // Small delay between groups to avoid rate limits
+        if (i + 1 < chunks.length) {
+          console.log('Waiting before processing next chunk group...');
+          await delay(1000);
         }
-      ]
+      } catch (chunkError) {
+        console.error(`Error processing chunk group ${i + 1}:`, chunkError);
+        throw chunkError;
+      }
+    }
+
+    // Combine all responses
+    const combinedMaterials = {
+      summary: [],
+      flashcards: [],
+      quiz: []
     };
 
-    console.log('Making OpenRouter request for chunk', chunk_index);
-    
-    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${openRouterApiKey}`,
-        'HTTP-Referer': 'https://westudy.com',
-        'X-Title': 'WeStudy'
-      },
-      body: JSON.stringify(requestBody)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('OpenRouter API error response:', {
-        status: response.status,
-        statusText: response.statusText,
-        body: errorText
-      });
-      throw new Error(`OpenRouter API error: ${response.status} ${response.statusText}`);
+    for (const response of allResponses) {
+      if (response.summary) combinedMaterials.summary.push(...response.summary);
+      if (response.flashcards) combinedMaterials.flashcards.push(...response.flashcards);
+      if (response.quiz) combinedMaterials.quiz.push(...response.quiz);
     }
 
-    const result = await response.json();
-    console.log('OpenRouter raw response:', JSON.stringify(result, null, 2));
+    // Deduplicate and limit items
+    combinedMaterials.summary = Array.from(new Set(combinedMaterials.summary));
+    combinedMaterials.flashcards = combinedMaterials.flashcards
+      .filter((card, index, self) => 
+        index === self.findIndex(c => c.question === card.question));
+    combinedMaterials.quiz = combinedMaterials.quiz
+      .filter((q, index, self) => 
+        index === self.findIndex(item => item.question === q.question));
 
-    if (!result || !result.choices || !result.choices.length) {
-      console.error('Invalid response structure from OpenRouter:', result);
-      throw new Error('Invalid response from OpenRouter: No choices returned');
-    }
+    console.log('Study materials generation completed successfully');
+    return combinedMaterials;
 
-    const choice = result.choices[0];
-    if (!choice.message || !choice.message.content) {
-      console.error('Invalid choice structure from OpenRouter:', choice);
-      throw new Error('Invalid choice from OpenRouter: No message content');
-    }
-
-    const generatedContent = choice.message.content;
-    console.log('Generated content:', generatedContent);
-
-    // Try parsing the raw response first
-    try {
-      const parsedContent = JSON.parse(generatedContent);
-      
-      // Validate the structure
-      if (!parsedContent.summary || !Array.isArray(parsedContent.questions) || 
-          !parsedContent.difficulty_level || !parsedContent.estimated_study_time) {
-        console.error('Invalid content structure:', parsedContent);
-        throw new Error('Invalid response structure');
-      }
-
-      return parsedContent;
-    } catch (parseError) {
-      // If direct parsing fails, try sanitizing
-      console.error('Direct parsing failed, attempting sanitization:', parseError);
-      try {
-        const sanitizedJson = sanitizeJsonString(generatedContent);
-        console.log('Sanitized JSON:', sanitizedJson);
-        const parsedContent = JSON.parse(sanitizedJson);
-        
-        if (!parsedContent.summary || !Array.isArray(parsedContent.questions) || 
-            !parsedContent.difficulty_level || !parsedContent.estimated_study_time) {
-          throw new Error('Invalid response structure after sanitization');
-        }
-
-        return parsedContent;
-      } catch (sanitizeError) {
-        console.error('Error parsing AI response after sanitization:', sanitizeError);
-        throw new Error('Failed to parse AI response');
-      }
-    }
   } catch (error) {
-    console.error(`Error generating study materials for chunk ${chunk_index}:`, error);
-    throw error;
+    console.error('Error generating study materials:', error);
+    if (error.message.includes('rate limit')) {
+      throw new Error('API rate limit reached. Please try again in a few minutes.');
+    } else if (error.message.includes('Invalid JSON')) {
+      throw new Error('Error processing content. Please try with a different video.');
+    } else {
+      throw new Error('Failed to generate study materials. Please try again.');
+    }
   }
+}
+
+function generatePrompt(content) {
+  return `
+    Generate comprehensive study materials in valid JSON format.
+    
+    Content: ${content}
+
+    Return ONLY a valid JSON object like this (no other text or explanation):
+    {
+      "summary": [
+        "Key point about the topic",
+        "Another key point",
+        "more points if available",
+        "... so on"
+      ],
+      "flashcards": [
+        {
+          "question": "Simple question avoiding quotes or special characters",
+          "answer": "Simple answer avoiding quotes or special characters"
+        }
+      ],
+      "quiz": [
+        {
+          "question": "Simple multiple choice question",
+          "options": [
+            "First choice",
+            "Second choice",
+            "Third choice",
+            "Fourth choice"
+          ],
+          "correctAnswer": "First choice",
+          "difficulty": "easy"
+        }
+      ],
+      "hashtags": ["topic1", "topic2"],
+      "difficulty_level": "beginner",
+      "estimated_study_time": "30"
+    }
+
+    IMPORTANT RULES:
+    1. Return ONLY the JSON object above, no other text
+    2. AVOID using quotes within text content - rephrase if needed
+    3. For HTML/CSS examples, use single quotes instead of double quotes
+    4. Keep questions and answers simple, avoid special characters
+    5. Generate as many flashcards as needed to cover important concepts
+    6. Generate quiz questions across different difficulty levels:
+       - easy: Basic recall questions
+       - medium: Understanding and application
+       - hard: Complex scenarios
+       - extreme: Advanced problem-solving
+    7. Add a difficulty field to each quiz question
+    8. Focus on key concepts from this section
+    9. Make sure questions are varied and cover different aspects
+  `;
 }
 
 async function storeStudyMaterials(userId, url, materials, thumbnail) {
@@ -173,13 +307,13 @@ async function storeStudyMaterials(userId, url, materials, thumbnail) {
     // Log the initial materials
     console.log('Raw materials received:', {
       summary: materials.summary?.length,
-      questions: materials.questions?.length,
-      difficulty_level: materials.difficulty_level,
-      estimated_study_time: materials.estimated_study_time
+      flashcards: materials.flashcards?.length,
+      quiz: materials.quiz?.length,
+      hashtags: materials.hashtags?.length
     });
 
-    if (materials.questions?.length > 0) {
-      console.log('First question for reference:', materials.questions[0]);
+    if (materials.quiz?.length > 0) {
+      console.log('First quiz item for reference:', materials.quiz[0]);
     }
 
     // Store main study material
@@ -206,33 +340,74 @@ async function storeStudyMaterials(userId, url, materials, thumbnail) {
 
     console.log('Successfully stored study material with ID:', studyMaterial.id);
 
-    // Store questions
-    if (materials.questions?.length > 0) {
-      console.log('Preparing to store questions. Count:', materials.questions.length);
+    // Store flashcards
+    if (materials.flashcards?.length > 0) {
+      console.log('Storing flashcards:', materials.flashcards.length);
+      const { error: flashcardsError } = await supabase
+        .from('flashcards')
+        .insert(
+          materials.flashcards.map(card => ({
+            study_material_id: studyMaterial.id,
+            question: card.question,
+            answer: card.answer,
+            user_id: userId
+          }))
+        );
+
+      if (flashcardsError) {
+        console.error('Error storing flashcards:', flashcardsError);
+        throw flashcardsError;
+      }
+      console.log('Successfully stored flashcards');
+    }
+
+    // Store quizzes
+    if (materials.quiz?.length > 0) {
+      console.log('Preparing to store quizzes. Count:', materials.quiz.length);
       
-      // Log the formatted data for the first question
-      const formattedQuestions = materials.questions.map(q => ({
+      // Log the formatted data for the first quiz
+      const formattedQuizzes = materials.quiz.map(q => ({
         study_material_id: studyMaterial.id,
         question: q.question,
         options: `{${q.options.map(opt => `"${opt.replace(/"/g, '\\"')}"`).join(',')}}`,
-        correct_answer: q.correct_answer,
+        correct_answer: q.correctAnswer,
         user_id: userId
       }));
 
-      console.log('First formatted question for reference:', formattedQuestions[0]);
+      console.log('First formatted quiz for reference:', formattedQuizzes[0]);
       
-      const { data: questionData, error: questionError } = await supabase
+      const { data: quizData, error: quizError } = await supabase
         .from('quizzes')
-        .insert(formattedQuestions)
+        .insert(formattedQuizzes)
         .select();
 
-      if (questionError) {
-        console.error('Error storing questions:', questionError);
-        throw questionError;
+      if (quizError) {
+        console.error('Error storing quizzes:', quizError);
+        throw quizError;
       }
-      console.log('Successfully stored questions. Count:', questionData?.length);
+      console.log('Successfully stored quizzes. Count:', quizData?.length);
     } else {
-      console.log('No questions to store');
+      console.log('No quizzes to store');
+    }
+
+    // Store hashtags
+    if (materials.hashtags?.length > 0) {
+      console.log('Storing hashtags:', materials.hashtags.length);
+      const { error: hashtagsError } = await supabase
+        .from('hashtags')
+        .insert(
+          materials.hashtags.map(tag => ({
+            study_material_id: studyMaterial.id,
+            tag: tag.toLowerCase(),
+            user_id: userId
+          }))
+        );
+
+      if (hashtagsError) {
+        console.error('Error storing hashtags:', hashtagsError);
+        throw hashtagsError;
+      }
+      console.log('Successfully stored hashtags');
     }
 
     return studyMaterial.id;
@@ -281,64 +456,14 @@ export async function POST(request) {
       throw new Error('Unsupported content type');
     }
 
-    // Split content into smaller chunks for processing
-    const chunkSize = 5000; // Process 5000 characters at a time
-    const contentChunks = content.match(new RegExp(`.{1,${chunkSize}}`, 'g')) || [];
-    const concurrencyLimit = 3; // Process 3 chunks at a time
-    
-    const chunks = chunkArray(contentChunks, concurrencyLimit);
-    let allResponses = [];
+    // Generate study materials
+    const studyMaterials = await generateStudyMaterials(content);
 
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkGroup = chunks[i];
-      console.log(`Processing chunk group ${i + 1}/${chunks.length}`);
-
-      try {
-        // Process chunks in parallel
-        const chunkPromises = chunkGroup.map(async (chunk, index) => {
-          return generateStudyMaterials(chunk, i * concurrencyLimit + index);
-        });
-
-        const chunkResults = await Promise.all(chunkPromises);
-        allResponses = allResponses.concat(chunkResults);
-
-        // Small delay between groups to avoid rate limits
-        if (i + 1 < chunks.length) {
-          console.log('Waiting before processing next chunk group...');
-          await delay(1000);
-        }
-      } catch (chunkError) {
-        console.error(`Error processing chunk group ${i + 1}:`, chunkError);
-        throw chunkError;
-      }
-    }
-
-    // Combine all responses
-    const combinedMaterials = {
-      summary: [],
-      questions: [],
-      difficulty_level: allResponses[0].difficulty_level,
-      estimated_study_time: allResponses[0].estimated_study_time
-    };
-
-    for (const response of allResponses) {
-      if (response.summary) combinedMaterials.summary.push(...response.summary);
-      if (response.questions) combinedMaterials.questions.push(...response.questions);
-    }
-
-    // Deduplicate and limit items
-    combinedMaterials.summary = Array.from(new Set(combinedMaterials.summary));
-    combinedMaterials.questions = combinedMaterials.questions
-      .filter((q, index, self) => 
-        index === self.findIndex(item => item.question === q.question));
-
-    console.log('Study materials generation completed successfully');
-    
     // Store in database
-    await storeStudyMaterials(userId, url, combinedMaterials, thumbnail);
+    await storeStudyMaterials(userId, url, studyMaterials, thumbnail);
 
     return NextResponse.json({ 
-      ...combinedMaterials, 
+      ...studyMaterials, 
       cached: false,
       step: 'completed'
     });
